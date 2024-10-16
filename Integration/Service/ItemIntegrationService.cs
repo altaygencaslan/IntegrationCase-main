@@ -11,7 +11,9 @@ public sealed class ItemIntegrationService
     private ItemOperationBackend ItemIntegrationBackend { get; set; } = new();
 
     private static readonly MemoryCache _cache = MemoryCache.Default;
-    private object lockItem = new();
+    private readonly SemaphoreSlim _semaphore = new SemaphoreSlim(1, 1);
+    private IDatabase _redisCache;
+    private bool runDistributed = false;
 
     // This is called externally and can be called multithreaded, in parallel.
     // More than one item with the same content should not be saved. However,
@@ -20,22 +22,32 @@ public sealed class ItemIntegrationService
     public async Task<Result> SaveItem(string itemContent)
     {
         return
-        await Task<Result>.Run(() =>
+        await Task<Result>.Run(async () =>
         {
-            lock (lockItem)
-            {
-                bool existInCache = _cache.Contains(itemContent);
-                // Check the backend to see if the content is already saved.
-                if (existInCache || ItemIntegrationBackend.FindItemsWithContent(itemContent).Count != 0)
-                {
-                    return new Result(false, $"Duplicate item received with content {itemContent}.");
-                }
+            await _semaphore.WaitAsync();
 
-                //Date bilgisi ihtiyaç halinde değişir,
-                //Şimdilik db'ye kayıt süresi + 5 saniye olarak set'lendi
-                //ancak optimum süreye değiştirilmelidir
-                _cache.Add(itemContent, true, DateTime.Now.AddSeconds(45));
+            bool existInCache = false;
+            if (runDistributed)
+                existInCache = (await _redisCache.StringGetAsync(itemContent)).HasValue;
+            else
+                existInCache = _cache.Contains(itemContent);
+
+            // Check the backend to see if the content is already saved.
+            if (existInCache || ItemIntegrationBackend.FindItemsWithContent(itemContent).Count != 0)
+            {
+                return new Result(false, $"Duplicate item received with content {itemContent}.");
             }
+
+            //Date bilgisi ihtiyaç halinde değişir,
+            //Şimdilik db'ye kayıt süresi + 5 saniye olarak set'lendi
+            //ancak optimum süreye değiştirilmelidir
+            if (runDistributed)
+                await _redisCache.StringSetAsync(itemContent, itemContent, new TimeSpan(0, 0, seconds: 45));
+            else
+                _cache.Add(itemContent, true, DateTime.Now.AddSeconds(45));
+
+
+            _semaphore.Release();
 
             var item = ItemIntegrationBackend.SaveItem(itemContent);
             return new Result(true, $"Item with content {itemContent} saved with id {item.Id}");
